@@ -37,6 +37,7 @@ import time
 import shutil
 import json
 from codecs import *
+from distutils.version import LooseVersion
 from azure.storage import BlobService
 from Utils.WAAgentUtil import waagent
 import Utils.HandlerUtil as Util
@@ -49,6 +50,7 @@ with open(mfile,'r') as f:
     manifest = json.loads(f.read())[0]
     ExtensionShortName = manifest['name']
     Version = manifest['version']
+ExtensionFullName = "Microsoft.OSTCExtensions.CustomScriptForLinux"
 DownloadDirectory = 'download'
 
 # CustomScript-specific Operation
@@ -81,7 +83,8 @@ def main():
                 hutil = parse_context("Executing")
                 daemon(hutil)
             elif re.match("^([-/]*)(update)", a):
-                dummy_command("Update", "success", "Update succeeded")
+                hutil = parse_context("Update")
+                update(hutil)
     except Exception, e:
         err_msg = ("Failed with error: {0}, "
                    "{1}").format(e, traceback.format_exc())
@@ -100,6 +103,49 @@ def parse_context(operation):
     hutil = Util.HandlerUtility(waagent.Log, waagent.Error, ExtensionShortName)
     hutil.do_parse_context(operation)
     return hutil
+
+
+def update(hutil):
+    """
+    Check waagent version.
+    If waagent version >= 2.0.16, do nothing and return success.
+    If waagent version < 2.0.16,
+        Copy the status file and mrseq of the previous version
+        to the latest version. 
+    """
+    # This is a workround for waagent whose version is < 2.0.16.
+    waagent_version = LooseVersion(waagent.GuestAgentVersion.split('-')[-1])
+    if waagent_version >= LooseVersion("2.0.16"):
+        msg = "The version of waagent is >= 2.0.16. No need to copy status files and mrseq."
+        hutil.log(msg)
+        hutil.do_exit(0, 'Update', 'success', '0', 'Update succeeded. {0}'.format(msg))
+
+    hutil.log("The version of waagent is < 2.0.16. Need to copy status files and mrseq.")
+
+    plg_dir = get_plg_dir_with_latest_version()
+    if plg_dir is None:
+        msg = "Warn: The previous plugin directory is missing. Ignore copying status and mrseq."
+        hutil.log(msg)
+        hutil.do_exit(0, 'Update', 'success', '0', 'Update succeeded. {0}'.format(msg))
+    
+    try:
+        hutil.log("Copy status files and mrseq from old plugin dir to new")
+        old_plg_dir = plg_dir 
+        new_plg_dir = os.path.join(waagent.LibDir, "{0}-{1}".format(ExtensionFullName, Version))
+        old_ext_status_dir = os.path.join(old_plg_dir, "status")
+        new_ext_status_dir = os.path.join(new_plg_dir, "status")
+        if os.path.isdir(old_ext_status_dir):
+            for status_file in os.listdir(old_ext_status_dir):
+                status_file_path = os.path.join(old_ext_status_dir, status_file)
+                if os.path.isfile(status_file_path):
+                    shutil.copy2(status_file_path, new_ext_status_dir)
+        mrseq_file = os.path.join(old_plg_dir, "mrseq")
+        if os.path.isfile(mrseq_file):
+            shutil.copy(mrseq_file, new_plg_dir)
+    except Exception as e:
+        hutil.error("Failed to copy status file.")
+
+    hutil.do_exit(0, 'Install', 'success', '0', 'Install succeeded.')
 
 
 def enable(hutil):
@@ -512,6 +558,34 @@ def get_command_to_execute(hutil):
         return cmd_public
     else:
         return cmd_protected
+
+
+def get_plg_dir_with_latest_version():
+    plg_dir = None
+    latest_version_installed = LooseVersion("0.0")
+    version = LooseVersion(Version)
+    for item in os.listdir(waagent.LibDir):
+        itemPath = os.path.join(waagent.LibDir, item)
+        if os.path.isdir(itemPath) and ExtensionFullName in item:
+            try:
+                # Split plugin dir name with '-' to get intalled plugin name and version
+                sperator = item.rfind('-')
+                if sperator < 0:
+                    continue
+                installed_plg_name = item[0:sperator]
+                installed_plg_version = LooseVersion(item[sperator + 1:])
+                if installed_plg_version == version:
+                    continue
+                # Check installed plugin name and compare installed version to get the latest version installed
+                if installed_plg_name == ExtensionFullName and installed_plg_version > latest_version_installed:
+                    plg_dir = itemPath
+                    previous_version = str(installed_plg_version)
+                    latest_version_installed = installed_plg_version
+            except Exception as e:
+                hutil.log("Warning: Invalid plugin dir name: {0} {1}".format(item, e))
+                continue
+
+    return plg_dir
 
 
 if __name__ == '__main__' :
